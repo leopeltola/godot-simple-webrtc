@@ -1,22 +1,23 @@
 @tool
 extends EditorPlugin
 
+const AUTOLOAD_NAME: String = "SimpleWebRTC"
+const AUTOLOAD_PATH: String = "res://addons/simple-webrtc/simple_webrtc_singleton.gd"
+
 
 func _enable_plugin() -> void:
-	# Add autoloads here.
-	pass
+	if not ProjectSettings.has_setting("autoload/%s" % AUTOLOAD_NAME):
+		add_autoload_singleton(AUTOLOAD_NAME, AUTOLOAD_PATH)
 
 
 func _disable_plugin() -> void:
-	# Remove autoloads here.
-	pass
+	if ProjectSettings.has_setting("autoload/%s" % AUTOLOAD_NAME):
+		remove_autoload_singleton(AUTOLOAD_NAME)
 
 
 func _enter_tree() -> void:
-	# Initialization of the plugin goes here.
 	pass
 
 
 func _exit_tree() -> void:
-	# Clean-up of the plugin goes here.
 	pass

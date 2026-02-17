@@ -11,8 +11,13 @@ config_version=5
 [application]
 
 config/name="godot"
+run/main_scene="uid://jb5i1crm3ssq"
 config/features=PackedStringArray("4.6", "Forward Plus")
 config/icon="res://icon.svg"
+
+[autoload]
+
+SimpleWebRTC="*uid://c8uq7a8cywwqe"
 
 [dotnet]
 
