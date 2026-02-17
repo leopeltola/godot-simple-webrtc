@@ -6,7 +6,7 @@ FastAPI signaling relay for the Godot addon.
 
 - Room registry with `room_id`, `host_id`, `peer_ids`, sealed/full state.
 - Validated `signal` relay only for peers in the same room.
-- Lobby listing via WebSocket (`list_lobbies`) and HTTP (`GET /lobbies`).
+- Lobby listing via WebSocket snapshots + real-time deltas (`subscribe_lobbies`, `lobby_snapshot`, `lobby_delta`).
 - Host disconnect handling (`room_closed` broadcast + room cleanup).
 - Stale room pruning every 60 seconds.
 
@@ -54,8 +54,12 @@ Example:
 
 ### Protocol Messages
 
-- `list_lobbies` (C→S)
+- `subscribe_lobbies` (C→S)
+- `unsubscribe_lobbies` (C→S)
+- `list_lobbies` (C→S, one-shot snapshot; compatibility)
 - `join` (C→S)
+- `lobby_snapshot` (S→C)
+- `lobby_delta` (S→C)
 - `id_assigned` (S→C)
 - `peer_joined` (S→C)
 - `signal` (C↔S)

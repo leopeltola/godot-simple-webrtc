@@ -14,8 +14,6 @@ extends Control
 
 var _webrtc: SimpleWebRTC
 var _lobby_items: Array[Dictionary] = []
-var _lobby_request: HTTPRequest
-var _lobby_request_in_flight: bool = false
 
 
 func _ready() -> void:
@@ -38,17 +36,19 @@ func _ready() -> void:
 
 	_webrtc = singleton as SimpleWebRTC
 	_webrtc.lobby_list_received.connect(_on_lobby_list_received)
+	_webrtc.lobby_feed_connected.connect(_on_lobby_feed_connected)
+	_webrtc.lobby_feed_disconnected.connect(_on_lobby_feed_disconnected)
+	_webrtc.lobby_delta_received.connect(_on_lobby_delta_received)
+	_webrtc.lobby_error.connect(_on_lobby_error)
 	_webrtc.signaling_connected.connect(_on_signaling_connected)
 	_webrtc.match_ready.connect(_on_match_ready)
 	_webrtc.room_closed.connect(_on_room_closed)
 	_webrtc.connection_error.connect(_on_connection_error)
 	_webrtc.state_changed.connect(_on_state_changed)
-
-	_lobby_request = HTTPRequest.new()
-	add_child(_lobby_request)
-	_lobby_request.request_completed.connect(_on_lobby_http_completed)
+	multiplayer.peer_connected.connect(_on_multiplayer_peer_connected)
 
 	signaling_url_input.text = _webrtc.signaling_url
+	_start_lobby_feed()
 	status_label.text = "Ready"
 	_append_log("Demo initialized.")
 
@@ -57,87 +57,20 @@ func _on_refresh_pressed() -> void:
 	if _webrtc == null:
 		return
 	_webrtc.signaling_url = signaling_url_input.text.strip_edges()
-	_request_lobbies_over_http(_webrtc.signaling_url)
-	_append_log("Requested lobby list.")
+	_start_lobby_feed()
+	_append_log("Requested lobby snapshot + delta feed.")
 
 
-func _request_lobbies_over_http(ws_url: String) -> void:
-	if _lobby_request_in_flight:
-		_append_log("Lobby request already in flight.")
+func _start_lobby_feed() -> void:
+	if _webrtc == null:
 		return
-
-	var http_url: String = _lobbies_http_url_from_ws(ws_url)
-	if http_url.is_empty():
-		status_label.text = "Invalid signaling URL"
-		_append_log("[color=red]Could not convert signaling URL to HTTP endpoint.[/color]")
+	_webrtc.disconnect_lobby_feed()
+	var connect_error: Error = _webrtc.connect_lobby_feed()
+	if connect_error != OK:
+		status_label.text = "Lobby feed failed"
+		_append_log("[color=red]Unable to connect lobby feed: %s[/color]" % error_string(connect_error))
 		return
-
-	var request_error: Error = _lobby_request.request(http_url)
-	if request_error != OK:
-		status_label.text = "Lobby request failed"
-		_append_log("[color=red]HTTP request start failed: %s[/color]" % error_string(request_error))
-		return
-
-	_lobby_request_in_flight = true
-
-
-func _lobbies_http_url_from_ws(ws_url: String) -> String:
-	var trimmed: String = ws_url.strip_edges()
-	if trimmed.is_empty():
-		return ""
-
-	var rest: String = ""
-	var scheme: String = ""
-	if trimmed.begins_with("ws://"):
-		scheme = "http://"
-		rest = trimmed.substr(5)
-	elif trimmed.begins_with("wss://"):
-		scheme = "https://"
-		rest = trimmed.substr(6)
-	else:
-		return ""
-
-	var base_url: String = "%s%s" % [scheme, rest]
-	var ws_suffix_index: int = base_url.find("/ws")
-	if ws_suffix_index >= 0:
-		base_url = base_url.substr(0, ws_suffix_index)
-
-	if base_url.ends_with("/"):
-		return "%slobbies" % base_url
-	return "%s/lobbies" % base_url
-
-
-func _on_lobby_http_completed(result: int, response_code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
-	_lobby_request_in_flight = false
-
-	if result != HTTPRequest.RESULT_SUCCESS:
-		status_label.text = "Lobby request failed"
-		_append_log("[color=red]HTTP request failed with result=%d[/color]" % result)
-		return
-
-	if response_code != 200:
-		status_label.text = "Lobby request failed"
-		_append_log("[color=red]Unexpected HTTP status: %d[/color]" % response_code)
-		return
-
-	var payload_text: String = body.get_string_from_utf8()
-	var parsed: Variant = JSON.parse_string(payload_text)
-	if typeof(parsed) != TYPE_DICTIONARY:
-		status_label.text = "Lobby parse failed"
-		_append_log("[color=red]Invalid lobby response JSON.[/color]")
-		return
-
-	var payload: Dictionary = parsed
-	var lobbies_variant: Variant = payload.get("lobbies", [])
-	if typeof(lobbies_variant) != TYPE_ARRAY:
-		status_label.text = "Lobby parse failed"
-		_append_log("[color=red]Lobby payload missing lobbies array.[/color]")
-		return
-
-	var lobbies_raw: Array = lobbies_variant
-	var lobbies_typed: Array[Dictionary] = []
-	lobbies_typed.assign(lobbies_raw)
-	_on_lobby_list_received(lobbies_typed)
+	_webrtc.subscribe_lobbies()
 
 
 func _on_host_pressed() -> void:
@@ -185,6 +118,7 @@ func _on_join_pressed() -> void:
 func _on_leave_pressed() -> void:
 	if _webrtc == null:
 		return
+	_log_connected_peer_ids("Demo ending")
 	_webrtc.leave()
 	_append_log("Left signaling session.")
 
@@ -215,6 +149,22 @@ func _on_lobby_list_received(lobbies: Array[Dictionary]) -> void:
 	_append_log("Received %d lobby entries." % lobbies.size())
 
 
+func _on_lobby_feed_connected() -> void:
+	_append_log("Lobby feed connected.")
+
+
+func _on_lobby_feed_disconnected() -> void:
+	_append_log("Lobby feed disconnected.")
+
+
+func _on_lobby_delta_received(op: String, room_id: String, _lobby: Dictionary) -> void:
+	_append_log("Lobby delta: %s %s" % [op, room_id])
+
+
+func _on_lobby_error(reason: String) -> void:
+	_append_log("[color=red]Lobby error: %s[/color]" % reason)
+
+
 func _on_signaling_connected(peer_id: int) -> void:
 	var multiplayer_id: int = multiplayer.get_unique_id()
 	status_label.text = "Signaling peer %d | Multiplayer peer %d" % [peer_id, multiplayer_id]
@@ -224,6 +174,12 @@ func _on_signaling_connected(peer_id: int) -> void:
 func _on_match_ready() -> void:
 	status_label.text = "Match ready, websocket closed"
 	_append_log("match_ready received; continuing over WebRTC.")
+	_log_connected_peer_ids("Match ready")
+
+
+func _on_multiplayer_peer_connected(remote_peer_id: int) -> void:
+	_append_log("Godot multiplayer peer_connected: remote_peer_id=%d" % remote_peer_id)
+	_log_connected_peer_ids("After peer_connected")
 
 
 func _on_room_closed() -> void:
@@ -257,6 +213,15 @@ func _state_to_text(state_value: int) -> String:
 
 func _append_log(message: String) -> void:
 	log_output.append_text("%s\n" % message)
+
+
+func _log_connected_peer_ids(context: String) -> void:
+	var local_id: int = multiplayer.get_unique_id()
+	var peers: PackedInt32Array = multiplayer.get_peers()
+	var peer_ids_text: String = "[]"
+	if peers.size() > 0:
+		peer_ids_text = "[%s]" % ", ".join(Array(peers).map(func(peer_id: int) -> String: return str(peer_id)))
+	_append_log("%s | local_unique_id=%d | connected_peer_ids=%s" % [context, local_id, peer_ids_text])
 
 
 func _set_buttons_enabled(enabled: bool) -> void:

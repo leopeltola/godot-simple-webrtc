@@ -29,7 +29,7 @@ theme_override_constants/separation = 8
 
 [node name="Title" type="Label" parent="Margin/RootColumn" unique_id=1858987226]
 layout_mode = 2
-text = "SimpleWebRTC v2 Demo"
+text = "SimpleWebRTC Demo"
 
 [node name="SignalingRow" type="HBoxContainer" parent="Margin/RootColumn" unique_id=1383126907]
 layout_mode = 2

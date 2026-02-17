@@ -65,6 +65,13 @@ class PeerSession:
 
 
 @dataclass(slots=True)
+class LobbySubscription:
+    connection_id: int
+    websocket: WebSocket
+    filter_tags: set[str] = field(default_factory=set)
+
+
+@dataclass(slots=True)
 class Room:
     room_id: str
     host_id: int
@@ -88,13 +95,20 @@ class Registry:
     def __init__(self) -> None:
         self.rooms: dict[str, Room] = {}
         self.peers: dict[int, PeerSession] = {}
+        self.lobby_subscriptions: dict[int, LobbySubscription] = {}
         self._next_peer_id: int = 1
+        self._next_connection_id: int = 1
         self.lock: asyncio.Lock = asyncio.Lock()
 
     def allocate_peer_id(self) -> int:
         peer_id: int = self._next_peer_id
         self._next_peer_id += 1
         return peer_id
+
+    def allocate_connection_id(self) -> int:
+        connection_id: int = self._next_connection_id
+        self._next_connection_id += 1
+        return connection_id
 
 
 app = FastAPI(title="SimpleWebRTC v2 Signaling Server", version="2.0.0")
@@ -152,6 +166,30 @@ def room_to_lobby(room: Room) -> dict[str, Any]:
     }
 
 
+def _normalize_filter_tags(raw_tags: Any) -> set[str]:
+    if not isinstance(raw_tags, list):
+        return set()
+    return {str(item).strip() for item in raw_tags if str(item).strip()}
+
+
+def _is_room_visible_to_filter(room: Room, filter_tags: set[str]) -> bool:
+    if room.is_sealed or room.is_full:
+        return False
+    if filter_tags and not filter_tags.issubset(set(room.tags)):
+        return False
+    return True
+
+
+def _build_lobby_snapshot(
+    rooms: list[Room], filter_tags: set[str]
+) -> list[dict[str, Any]]:
+    return [
+        room_to_lobby(room)
+        for room in rooms
+        if _is_room_visible_to_filter(room, filter_tags)
+    ]
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -202,13 +240,9 @@ async def list_lobbies(filter_tags: str | None = None) -> dict[str, Any]:
         }
 
     async with registry.lock:
-        lobbies: list[dict[str, Any]] = []
-        for room in registry.rooms.values():
-            if room.is_sealed or room.is_full:
-                continue
-            if tags and not tags.issubset(set(room.tags)):
-                continue
-            lobbies.append(room_to_lobby(room))
+        lobbies: list[dict[str, Any]] = _build_lobby_snapshot(
+            list(registry.rooms.values()), tags
+        )
         return {"type": "lobby_list", "lobbies": lobbies}
 
 
@@ -216,6 +250,7 @@ async def list_lobbies(filter_tags: str | None = None) -> dict[str, Any]:
 async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
     logger.info("WebSocket accepted from %s", _client_label(websocket))
+    connection_id: int = registry.allocate_connection_id()
     peer_id: int | None = None
 
     try:
@@ -233,6 +268,14 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
             if message_type == "list_lobbies":
                 await handle_list_lobbies(websocket, message)
+                continue
+
+            if message_type == "subscribe_lobbies":
+                await handle_subscribe_lobbies(connection_id, websocket, message)
+                continue
+
+            if message_type == "unsubscribe_lobbies":
+                await handle_unsubscribe_lobbies(connection_id)
                 continue
 
             if peer_id is None:
@@ -254,6 +297,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         )
         if peer_id is not None:
             await handle_disconnect(peer_id)
+        await handle_unsubscribe_lobbies(connection_id)
     except Exception:
         logger.exception(
             "Unhandled exception in websocket loop for %s (peer_id=%s)",
@@ -262,6 +306,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         )
         if peer_id is not None:
             await handle_disconnect(peer_id)
+        await handle_unsubscribe_lobbies(connection_id)
 
 
 async def receive_client_message(websocket: WebSocket) -> dict[str, Any] | None:
@@ -381,6 +426,8 @@ async def handle_join(websocket: WebSocket, message: dict[str, Any]) -> int | No
             room.capacity,
         )
 
+    await notify_lobby_room_changed(room_id)
+
     await send_json(
         websocket,
         {
@@ -415,21 +462,74 @@ async def handle_join(websocket: WebSocket, message: dict[str, Any]) -> int | No
 
 
 async def handle_list_lobbies(websocket: WebSocket, message: dict[str, Any]) -> None:
-    tags_raw: Any = message.get("filter_tags", [])
-    tags: set[str] = (
-        {str(item) for item in tags_raw} if isinstance(tags_raw, list) else set()
-    )
+    tags: set[str] = _normalize_filter_tags(message.get("filter_tags", []))
 
     async with registry.lock:
-        lobbies: list[dict[str, Any]] = []
-        for room in registry.rooms.values():
-            if room.is_sealed or room.is_full:
-                continue
-            if tags and not tags.issubset(set(room.tags)):
-                continue
-            lobbies.append(room_to_lobby(room))
+        lobbies: list[dict[str, Any]] = _build_lobby_snapshot(
+            list(registry.rooms.values()), tags
+        )
 
+    # Keep legacy lobby_list for compatibility and include new snapshot event.
     await send_json(websocket, {"type": "lobby_list", "lobbies": lobbies})
+    await send_json(websocket, {"type": "lobby_snapshot", "lobbies": lobbies})
+
+
+async def handle_subscribe_lobbies(
+    connection_id: int, websocket: WebSocket, message: dict[str, Any]
+) -> None:
+    filter_tags: set[str] = _normalize_filter_tags(message.get("filter_tags", []))
+
+    async with registry.lock:
+        registry.lobby_subscriptions[connection_id] = LobbySubscription(
+            connection_id=connection_id,
+            websocket=websocket,
+            filter_tags=filter_tags,
+        )
+        lobbies: list[dict[str, Any]] = _build_lobby_snapshot(
+            list(registry.rooms.values()), filter_tags
+        )
+
+    await send_json(websocket, {"type": "lobby_snapshot", "lobbies": lobbies})
+
+
+async def handle_unsubscribe_lobbies(connection_id: int) -> None:
+    async with registry.lock:
+        registry.lobby_subscriptions.pop(connection_id, None)
+
+
+async def notify_lobby_room_changed(room_id: str) -> None:
+    async with registry.lock:
+        room: Room | None = registry.rooms.get(room_id)
+        subscriptions: list[LobbySubscription] = list(
+            registry.lobby_subscriptions.values()
+        )
+
+    send_tasks: list[asyncio.Task[Any]] = []
+    for subscription in subscriptions:
+        if room is not None and _is_room_visible_to_filter(
+            room, subscription.filter_tags
+        ):
+            payload: dict[str, Any] = {
+                "type": "lobby_delta",
+                "op": "upsert",
+                "room_id": room.room_id,
+                "lobby": room_to_lobby(room),
+            }
+        else:
+            payload = {
+                "type": "lobby_delta",
+                "op": "remove",
+                "room_id": room_id,
+            }
+        send_tasks.append(
+            asyncio.create_task(send_json(subscription.websocket, payload))
+        )
+
+    if send_tasks:
+        results = await asyncio.gather(*send_tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                logger.debug("Lobby delta send raised exception: %s", result)
 
 
 async def handle_signal(from_peer_id: int, message: dict[str, Any]) -> None:
@@ -550,6 +650,8 @@ async def handle_disconnect(peer_id: int) -> None:
     elif peers_left:
         await broadcast_room(room, {"type": "peer_left", "peer_id": peer_id})
 
+    await notify_lobby_room_changed(room.room_id)
+
 
 @app.on_event("startup")
 async def startup_event() -> None:
@@ -590,3 +692,6 @@ async def prune_stale_rooms() -> None:
                     now - room.last_activity,
                     len(room.peer_ids),
                 )
+
+        for room_id in stale_room_ids:
+            await notify_lobby_room_changed(room_id)

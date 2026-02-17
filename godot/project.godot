@@ -10,7 +10,7 @@ config_version=5
 
 [application]
 
-config/name="godot"
+config/name="SimpleWebRTC"
 run/main_scene="uid://jb5i1crm3ssq"
 config/features=PackedStringArray("4.6", "Forward Plus")
 config/icon="res://icon.svg"

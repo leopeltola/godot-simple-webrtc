@@ -41,9 +41,20 @@ enum State {
 	CLEANUP,
 }
 
-## Emitted when [method refresh_lobby_list] returns lobby metadata from signaling.
+## Emitted when the lobby cache is updated (from snapshot or delta events).
 ## [param lobbies] is an array of dictionaries supplied by the signaling server.
 signal lobby_list_received(lobbies: Array[Dictionary])
+## Emitted when the lobby websocket feed connects.
+signal lobby_feed_connected()
+## Emitted when the lobby websocket feed disconnects.
+signal lobby_feed_disconnected()
+## Emitted when a full lobby snapshot is received from signaling.
+signal lobby_snapshot_received(lobbies: Array[Dictionary])
+## Emitted when a lobby delta update is received from signaling.
+## [param op] is [code]upsert[/code] or [code]remove[/code].
+signal lobby_delta_received(op: String, room_id: String, lobby: Dictionary)
+## Emitted for lobby feed protocol errors.
+signal lobby_error(reason: String)
 ## Emitted after a successful signaling join and peer id assignment.
 ## [param peer_id] is this client's signaling id.
 signal signaling_connected(peer_id: int)
@@ -72,6 +83,7 @@ var ice_servers: Array[Dictionary] = [
 
 var _state: State = State.IDLE
 var _socket: WebSocketPeer = WebSocketPeer.new()
+var _lobby_socket: WebSocketPeer = WebSocketPeer.new()
 var _webrtc_peer: WebRTCMultiplayerPeer = WebRTCMultiplayerPeer.new()
 var _rtc_connections: Dictionary[int, WebRTCPeerConnection] = {}
 var _rtc_connection_states: Dictionary[int, int] = {}
@@ -84,6 +96,10 @@ var _topology: Topology = Topology.MESH
 var _requested_topology: Topology = Topology.MESH
 var _capacity: int = 0
 var _pending_join_payload: Dictionary = {}
+var _pending_lobby_payload: Dictionary = {}
+var _lobby_filter_tags: PackedStringArray = PackedStringArray()
+var _lobby_cache: Dictionary[String, Dictionary] = {}
+var _lobby_last_ready_state: int = WebSocketPeer.STATE_CLOSED
 
 func _ready() -> void:
 	set_process(true)
@@ -116,13 +132,106 @@ func _process(_delta: float) -> void:
 		connection.poll()
 		_poll_connection_state(remote_peer_id, connection)
 
+	if _lobby_socket.get_ready_state() == WebSocketPeer.STATE_CONNECTING or _lobby_socket.get_ready_state() == WebSocketPeer.STATE_OPEN:
+		_lobby_socket.poll()
 
-## Requests the current list of open lobbies from signaling.
+	if _lobby_socket.get_ready_state() == WebSocketPeer.STATE_OPEN:
+		if _lobby_last_ready_state != WebSocketPeer.STATE_OPEN:
+			lobby_feed_connected.emit()
+		if not _pending_lobby_payload.is_empty():
+			_send_to_lobby_feed(_pending_lobby_payload)
+			_pending_lobby_payload.clear()
+		while _lobby_socket.get_available_packet_count() > 0:
+			var packet_text: String = _lobby_socket.get_packet().get_string_from_utf8()
+			_handle_lobby_packet(packet_text)
+	elif _lobby_last_ready_state == WebSocketPeer.STATE_OPEN and _lobby_socket.get_ready_state() == WebSocketPeer.STATE_CLOSED:
+		lobby_feed_disconnected.emit()
+
+	_lobby_last_ready_state = _lobby_socket.get_ready_state()
+
+
+## Connects the dedicated websocket lobby feed.
 ##
-## Assumes the signaling socket is connected/open. If called while disconnected,
-## the request is ignored by [method _send_to_signaling].
-func refresh_lobby_list() -> void:
-	_send_to_signaling({"type": "list_lobbies"})
+## Returns [code]OK[/code] on success or [code]FAILED[/code] if [member signaling_url]
+## is invalid or the websocket cannot start connecting.
+func connect_lobby_feed() -> Error:
+	if signaling_url.strip_edges().is_empty():
+		lobby_error.emit("signaling_url_required")
+		return FAILED
+
+	var ready_state: int = _lobby_socket.get_ready_state()
+	if ready_state == WebSocketPeer.STATE_OPEN or ready_state == WebSocketPeer.STATE_CONNECTING:
+		return OK
+
+	_lobby_socket = WebSocketPeer.new()
+	_lobby_last_ready_state = WebSocketPeer.STATE_CLOSED
+	var connect_error: Error = _lobby_socket.connect_to_url(signaling_url)
+	if connect_error != OK:
+		lobby_error.emit("Unable to connect to lobby feed")
+		return connect_error
+	return OK
+
+
+## Disconnects the dedicated websocket lobby feed.
+func disconnect_lobby_feed() -> void:
+	if _lobby_socket.get_ready_state() == WebSocketPeer.STATE_OPEN:
+		_send_to_lobby_feed({"type": "unsubscribe_lobbies"})
+		_lobby_socket.close(1000, "lobby feed disconnect")
+	_pending_lobby_payload.clear()
+	_lobby_last_ready_state = WebSocketPeer.STATE_CLOSED
+
+
+## Subscribes to lobby snapshot + delta updates over the dedicated lobby feed.
+##
+## [param filter_tags] applies server-side tag filtering.
+func subscribe_lobbies(filter_tags: PackedStringArray = PackedStringArray()) -> void:
+	_lobby_filter_tags = filter_tags
+	var connect_error: Error = connect_lobby_feed()
+	if connect_error != OK:
+		return
+
+	var payload: Dictionary = {
+		"type": "subscribe_lobbies",
+		"filter_tags": Array(filter_tags),
+	}
+	if _lobby_socket.get_ready_state() == WebSocketPeer.STATE_OPEN:
+		_send_to_lobby_feed(payload)
+	else:
+		_pending_lobby_payload = payload
+
+
+## Unsubscribes from lobby snapshot + delta updates.
+func unsubscribe_lobbies() -> void:
+	_lobby_filter_tags = PackedStringArray()
+	_pending_lobby_payload.clear()
+	_send_to_lobby_feed({"type": "unsubscribe_lobbies"})
+
+
+## Requests an on-demand lobby snapshot over websocket.
+##
+## This keeps compatibility with existing [signal lobby_list_received] consumers.
+func refresh_lobby_list(filter_tags: PackedStringArray = PackedStringArray()) -> void:
+	if filter_tags.size() > 0:
+		_lobby_filter_tags = filter_tags
+	var connect_error: Error = connect_lobby_feed()
+	if connect_error != OK:
+		return
+	var payload: Dictionary = {
+		"type": "list_lobbies",
+		"filter_tags": Array(_lobby_filter_tags),
+	}
+	if _lobby_socket.get_ready_state() == WebSocketPeer.STATE_OPEN:
+		_send_to_lobby_feed(payload)
+	else:
+		_pending_lobby_payload = payload
+
+
+## Returns the current in-memory lobby cache.
+func get_lobbies() -> Array[Dictionary]:
+	var lobbies: Array[Dictionary] = []
+	for lobby: Dictionary in _lobby_cache.values():
+		lobbies.append(lobby)
+	return lobbies
 
 
 ## Joins an existing lobby by id.
@@ -219,7 +328,7 @@ func _handle_signaling_packet(raw_message: String) -> void:
 		"signal":
 			_handle_signal(message)
 		"lobby_list":
-			lobby_list_received.emit(message.get("lobbies", []))
+			pass
 		"match_ready":
 			match_ready.emit()
 			if _socket.get_ready_state() == WebSocketPeer.STATE_OPEN:
@@ -233,6 +342,67 @@ func _handle_signaling_packet(raw_message: String) -> void:
 			leave()
 		_:
 			pass
+
+
+func _handle_lobby_packet(raw_message: String) -> void:
+	var parsed: Variant = JSON.parse_string(raw_message)
+	if typeof(parsed) != TYPE_DICTIONARY:
+		return
+	var message: Dictionary = parsed
+	var message_type: String = str(message.get("type", ""))
+
+	match message_type:
+		"lobby_snapshot", "lobby_list":
+			_apply_lobby_snapshot(message.get("lobbies", []))
+		"lobby_delta":
+			_apply_lobby_delta(message)
+		"error":
+			lobby_error.emit(str(message.get("message", "unknown lobby error")))
+		_:
+			pass
+
+
+func _apply_lobby_snapshot(lobbies_variant: Variant) -> void:
+	if typeof(lobbies_variant) != TYPE_ARRAY:
+		return
+	var lobbies_raw: Array = lobbies_variant
+	_lobby_cache.clear()
+	for entry_variant: Variant in lobbies_raw:
+		if typeof(entry_variant) != TYPE_DICTIONARY:
+			continue
+		var lobby: Dictionary = entry_variant
+		var room_id: String = str(lobby.get("room_id", "")).strip_edges()
+		if room_id.is_empty():
+			continue
+		_lobby_cache[room_id] = lobby
+
+	var lobbies: Array[Dictionary] = get_lobbies()
+	lobby_snapshot_received.emit(lobbies)
+	lobby_list_received.emit(lobbies)
+
+
+func _apply_lobby_delta(message: Dictionary) -> void:
+	var op: String = str(message.get("op", "")).strip_edges().to_lower()
+	var room_id: String = str(message.get("room_id", "")).strip_edges()
+	var lobby: Dictionary = {}
+
+	if op == "upsert":
+		if typeof(message.get("lobby", null)) == TYPE_DICTIONARY:
+			lobby = message.get("lobby")
+		if room_id.is_empty():
+			room_id = str(lobby.get("room_id", "")).strip_edges()
+		if room_id.is_empty():
+			return
+		_lobby_cache[room_id] = lobby
+	elif op == "remove":
+		if room_id.is_empty():
+			return
+		_lobby_cache.erase(room_id)
+	else:
+		return
+
+	lobby_delta_received.emit(op, room_id, lobby)
+	lobby_list_received.emit(get_lobbies())
 
 
 func _handle_id_assigned(message: Dictionary) -> void:
@@ -472,6 +642,13 @@ func _send_to_signaling(payload: Dictionary) -> void:
 	_socket.put_packet(serialized.to_utf8_buffer())
 
 
+func _send_to_lobby_feed(payload: Dictionary) -> void:
+	if _lobby_socket.get_ready_state() != WebSocketPeer.STATE_OPEN:
+		return
+	var serialized: String = JSON.stringify(payload)
+	_lobby_socket.put_packet(serialized.to_utf8_buffer())
+
+
 func _topology_to_string(topology: Topology) -> String:
 	match topology:
 		Topology.MESH:
@@ -496,3 +673,4 @@ func _cleanup() -> void:
 	_requested_topology = Topology.MESH
 	_capacity = 0
 	_pending_join_payload.clear()
+	_pending_lobby_payload.clear()
