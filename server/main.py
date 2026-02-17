@@ -13,8 +13,6 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from dotenv import load_dotenv
 
-__version__ = "0.0.0"
-
 load_dotenv()
 
 Topology = Literal["mesh", "server_authoritative"]
@@ -113,7 +111,7 @@ class Registry:
         return connection_id
 
 
-app = FastAPI(title="SimpleWebRTC Signaling Server", version=__version__)
+app = FastAPI(title="SimpleWebRTC Signaling Server", version="2.0.0")
 registry = Registry()
 ICE_SERVERS: list[dict[str, Any]] = _load_ice_servers()
 START_TIME: float = time.time()
