@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -99,6 +100,7 @@ class Registry:
 app = FastAPI(title="SimpleWebRTC v2 Signaling Server", version="2.0.0")
 registry = Registry()
 ICE_SERVERS: list[dict[str, Any]] = _load_ice_servers()
+START_TIME: float = time.time()
 
 
 def _client_label(websocket: WebSocket) -> str:
@@ -153,6 +155,42 @@ def room_to_lobby(room: Room) -> dict[str, Any]:
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/heartbeat")
+async def heartbeat() -> dict[str, Any]:
+    now: float = time.time()
+    async with registry.lock:
+        rooms_count: int = len(registry.rooms)
+        peers_count: int = len(registry.peers)
+
+    return {
+        "status": "ok",
+        "service": "simple-webrtc-signaling",
+        "uptime_seconds": round(now - START_TIME, 3),
+        "timestamp_unix": now,
+        "rooms": rooms_count,
+        "peers": peers_count,
+    }
+
+
+@app.get("/", response_class=HTMLResponse)
+async def root_status() -> str:
+    return """
+        <html>
+            <head><title>SimpleWebRTC Signaling</title></head>
+            <body style=\"font-family: sans-serif; margin: 2rem;\">
+                <h1>SimpleWebRTC Signaling Server</h1>
+                <p>Server is running.</p>
+                <ul>
+                    <li><a href=\"/heartbeat\">/heartbeat</a></li>
+                    <li><a href=\"/health\">/health</a></li>
+                    <li><a href=\"/lobbies\">/lobbies</a></li>
+                </ul>
+                <p>WebSocket endpoint: <code>/ws</code></p>
+            </body>
+        </html>
+        """
 
 
 @app.get("/lobbies")
