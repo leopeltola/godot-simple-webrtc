@@ -111,7 +111,7 @@ class Registry:
         return connection_id
 
 
-app = FastAPI(title="SimpleWebRTC v2 Signaling Server", version="2.0.0")
+app = FastAPI(title="SimpleWebRTC Signaling Server", version="2.0.0")
 registry = Registry()
 ICE_SERVERS: list[dict[str, Any]] = _load_ice_servers()
 START_TIME: float = time.time()
@@ -229,21 +229,6 @@ async def root_status() -> str:
             </body>
         </html>
         """
-
-
-@app.get("/lobbies")
-async def list_lobbies(filter_tags: str | None = None) -> dict[str, Any]:
-    tags: set[str] = set()
-    if filter_tags:
-        tags = {
-            segment.strip() for segment in filter_tags.split(",") if segment.strip()
-        }
-
-    async with registry.lock:
-        lobbies: list[dict[str, Any]] = _build_lobby_snapshot(
-            list(registry.rooms.values()), tags
-        )
-        return {"type": "lobby_list", "lobbies": lobbies}
 
 
 @app.websocket("/ws")
