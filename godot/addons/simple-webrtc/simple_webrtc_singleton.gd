@@ -1,10 +1,39 @@
 extends Node
 
+## SimpleWebRTC singleton for lobby discovery, signaling, and WebRTC peer setup.
+##
+##
+## This node manages the full connection lifecycle:[br]
+## [br]
+## - connect to signaling,[br]
+## - join/host lobbies,[br]
+## - exchange SDP/ICE,[br]
+## - initialize [code]WebRTCMultiplayerPeer[/code],[br]
+## - track handshake timeouts and cleanup.[br]
+##[br]
+## Assumptions:[br]
+## - A compatible signaling server is available at [member signaling_url] and uses the
+##   message schema expected in this script ([code]join[/code], [code]signal[/code], [code]lobby_list[/code], etc.).[br]
+## - A WebRTC backend is installed/enabled for the running platform
+##   ([code]godot-webrtc-native[/code]).[br]
+## - Consumers call [method join_lobby] or [method host_lobby] to start a session, and call
+##   [method leave] when done.[br]
+##[br]
+## Typical usage:[br]
+## 1) Optionally set [member signaling_url] and [member ice_servers].[br]
+## 2) Connect to [signal connection_error], [signal signaling_connected], and
+##    [signal match_ready].[br]
+## 3) Call [method host_lobby] or [method join_lobby].[br]
+## 4) Wait for [signal match_ready]/multiplayer events.[br]
+## 5) Call [method leave] to close and reset state.[br]
+
+## Network topology requested/used by a lobby.
 enum Topology {
 	MESH,
 	SERVER_AUTHORITATIVE,
 }
 
+## High-level lifecycle state for this singleton.
 enum State {
 	IDLE,
 	SIGNALING,
@@ -12,17 +41,31 @@ enum State {
 	CLEANUP,
 }
 
+## Emitted when [method refresh_lobby_list] returns lobby metadata from signaling.
+## [param lobbies] is an array of dictionaries supplied by the signaling server.
 signal lobby_list_received(lobbies: Array[Dictionary])
+## Emitted after a successful signaling join and peer id assignment.
+## [param peer_id] is this client's signaling id.
 signal signaling_connected(peer_id: int)
+## Emitted when signaling determines the room is ready to start the match.
 signal match_ready()
+## Emitted when the signaling server closes the room.
 signal room_closed()
+## Emitted for connection/signaling/WebRTC errors with a human-readable reason.
 signal connection_error(reason: String)
+## Emitted whenever the internal lifecycle state changes.
 signal state_changed(new_state: int)
 
+## Default WebSocket endpoint for the signaling server.
 const DEFAULT_SIGNALING_URL: String = "ws://127.0.0.1:8000/ws"
+## Maximum time to wait for a per-peer WebRTC handshake before failing.
 const HANDSHAKE_TIMEOUT_SECONDS: float = 15.0
 
+## Signaling server URL used by [method join_lobby] and [method host_lobby].
+## Set this before connecting if your signaling server is not local.
 var signaling_url: String = DEFAULT_SIGNALING_URL
+## ICE server configuration passed to [method WebRTCPeerConnection.initialize].
+## Defaults to Google's public STUN server. Can be replaced before joining/hosting.
 var ice_servers: Array[Dictionary] = [
 	{"urls": PackedStringArray(["stun:stun.l.google.com:19302"])}
 ]
@@ -74,10 +117,21 @@ func _process(_delta: float) -> void:
 		_poll_connection_state(remote_peer_id, connection)
 
 
+## Requests the current list of open lobbies from signaling.
+##
+## Assumes the signaling socket is connected/open. If called while disconnected,
+## the request is ignored by [method _send_to_signaling].
 func refresh_lobby_list() -> void:
 	_send_to_signaling({"type": "list_lobbies"})
 
 
+## Joins an existing lobby by id.
+##
+## [param room_id] must identify a valid room on the signaling server.
+## [param topology] must match the room topology or the singleton emits
+## [signal connection_error] and leaves.
+##
+## This initializes a fresh WebRTC session state and starts signaling.
 func join_lobby(room_id: String, topology: Topology = Topology.MESH) -> void:
 	_setup_webrtc_peer(ice_servers)
 	_topology = topology
@@ -85,6 +139,12 @@ func join_lobby(room_id: String, topology: Topology = Topology.MESH) -> void:
 	_connect_to_signaling(room_id, false, topology, 0)
 
 
+## Hosts (creates) a lobby with the given topology and capacity.
+##
+## [param capacity] is forwarded to signaling and enforced server-side.
+## For [code]SERVER_AUTHORITATIVE[/code], the host becomes multiplayer server peer id [code]1[/code].
+##
+## This initializes a fresh WebRTC session state and starts signaling.
 func host_lobby(room_id: String, topology: Topology, capacity: int) -> void:
 	_setup_webrtc_peer(ice_servers)
 	_topology = topology
@@ -92,6 +152,10 @@ func host_lobby(room_id: String, topology: Topology, capacity: int) -> void:
 	_connect_to_signaling(room_id, true, topology, capacity)
 
 
+## Leaves the current lobby/session and resets all internal networking state.
+##
+## Safe to call from any state. This closes signaling (if open), tears down
+## peer connections, clears timers, and returns to [code]State.IDLE[/code].
 func leave() -> void:
 	_transition_to(State.CLEANUP)
 	if _socket.get_ready_state() == WebSocketPeer.STATE_OPEN:

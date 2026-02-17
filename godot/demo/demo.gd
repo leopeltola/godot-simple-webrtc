@@ -29,7 +29,7 @@ func _ready() -> void:
 	leave_button.pressed.connect(_on_leave_pressed)
 	lobby_list.item_selected.connect(_on_lobby_selected)
 
-	var singleton: Node = get_node_or_null("/root/SimpleWebRTC")
+	var singleton: Node = SimpleWebRTC
 	if singleton == null:
 		status_label.text = "SimpleWebRTC autoload not found"
 		_append_log("[color=red]Enable the plugin to register the autoload.[/color]")
