@@ -16,6 +16,20 @@ FastAPI signaling relay for the Godot addon.
 uv run uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
+### Run with Docker
+
+Build:
+
+```bash
+docker build -t simple-webrtc-server:local server
+```
+
+Run:
+
+```bash
+docker run --rm -p 8000:8000 --env-file server/.env simple-webrtc-server:local
+```
+
 ### .env support (debug-friendly)
 
 The server automatically loads environment variables from `.env` using `python-dotenv`.
@@ -47,3 +61,10 @@ Example:
 - `signal` (C↔S)
 - `match_ready` (S→C)
 - `room_closed` (S→C)
+
+### Automated releases
+
+Pushing a SemVer tag (`vX.Y.Z`) triggers GitHub Actions to:
+
+- build a Godot addon zip and attach it to a GitHub Release,
+- build and push a Docker image to GHCR.
