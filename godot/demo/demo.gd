@@ -1,6 +1,7 @@
 extends Control
 
 @onready var signaling_url_input: LineEdit = %SignalingUrlInput
+@onready var game_id_input: LineEdit = %GameIdInput
 @onready var room_id_input: LineEdit = %RoomIdInput
 @onready var topology_option: OptionButton = %TopologyOption
 @onready var capacity_spin: SpinBox = %CapacitySpin
@@ -47,7 +48,8 @@ func _ready() -> void:
 	_webrtc.state_changed.connect(_on_state_changed)
 	multiplayer.peer_connected.connect(_on_multiplayer_peer_connected)
 
-	signaling_url_input.text = _webrtc.signaling_url
+	signaling_url_input.text = _webrtc.signaling_server_url
+	game_id_input.text = _webrtc.game_id
 	_start_lobby_feed()
 	status_label.text = "Ready"
 	_append_log("Demo initialized.")
@@ -56,7 +58,8 @@ func _ready() -> void:
 func _on_refresh_pressed() -> void:
 	if _webrtc == null:
 		return
-	_webrtc.signaling_url = signaling_url_input.text.strip_edges()
+	_webrtc.signaling_server_url = signaling_url_input.text.strip_edges()
+	_webrtc.game_id = game_id_input.text.strip_edges()
 	_start_lobby_feed()
 	_append_log("Requested lobby snapshot + delta feed.")
 
@@ -64,6 +67,10 @@ func _on_refresh_pressed() -> void:
 func _start_lobby_feed() -> void:
 	if _webrtc == null:
 		return
+	if game_id_input.text.strip_edges().is_empty():
+		status_label.text = "Game ID required"
+		return
+	_webrtc.game_id = game_id_input.text.strip_edges()
 	_webrtc.disconnect_lobby_feed()
 	var connect_error: Error = _webrtc.connect_lobby_feed()
 	if connect_error != OK:
@@ -80,8 +87,12 @@ func _on_host_pressed() -> void:
 	if room_id.is_empty():
 		status_label.text = "Room ID required"
 		return
+	if game_id_input.text.strip_edges().is_empty():
+		status_label.text = "Game ID required"
+		return
 
-	_webrtc.signaling_url = signaling_url_input.text.strip_edges()
+	_webrtc.signaling_server_url = signaling_url_input.text.strip_edges()
+	_webrtc.game_id = game_id_input.text.strip_edges()
 	_webrtc.ice_servers = [
 		{"urls": PackedStringArray(["stun:stun.l.google.com:19302"])}
 	]
@@ -105,8 +116,12 @@ func _on_join_pressed() -> void:
 	if room_id.is_empty():
 		status_label.text = "Room ID required"
 		return
+	if game_id_input.text.strip_edges().is_empty():
+		status_label.text = "Game ID required"
+		return
 
-	_webrtc.signaling_url = signaling_url_input.text.strip_edges()
+	_webrtc.signaling_server_url = signaling_url_input.text.strip_edges()
+	_webrtc.game_id = game_id_input.text.strip_edges()
 	_webrtc.ice_servers = [
 		{"urls": PackedStringArray(["stun:stun.l.google.com:19302"])}
 	]
@@ -180,6 +195,7 @@ func _on_match_ready() -> void:
 func _on_multiplayer_peer_connected(remote_peer_id: int) -> void:
 	_append_log("Godot multiplayer peer_connected: remote_peer_id=%d" % remote_peer_id)
 	_log_connected_peer_ids("After peer_connected")
+	_append_log("multiplayer.is_server: %s" % multiplayer.is_server())
 
 
 func _on_room_closed() -> void:

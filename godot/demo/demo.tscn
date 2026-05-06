@@ -37,13 +37,27 @@ theme_override_constants/separation = 8
 
 [node name="SignalingUrlLabel" type="Label" parent="Margin/RootColumn/SignalingRow" unique_id=1680626642]
 layout_mode = 2
-text = "Signaling URL"
+text = "Signaling Base URL"
 
 [node name="SignalingUrlInput" type="LineEdit" parent="Margin/RootColumn/SignalingRow" unique_id=747065948]
 unique_name_in_owner = true
 layout_mode = 2
 size_flags_horizontal = 3
 text = "ws://127.0.0.1:8000/ws"
+
+[node name="GameRow" type="HBoxContainer" parent="Margin/RootColumn" unique_id=1049013029]
+layout_mode = 2
+theme_override_constants/separation = 8
+
+[node name="GameIdLabel" type="Label" parent="Margin/RootColumn/GameRow" unique_id=1719310588]
+layout_mode = 2
+text = "Game ID"
+
+[node name="GameIdInput" type="LineEdit" parent="Margin/RootColumn/GameRow" unique_id=1212057381]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+placeholder_text = "tinyaow"
 
 [node name="RoomRow" type="HBoxContainer" parent="Margin/RootColumn" unique_id=1071589194]
 layout_mode = 2

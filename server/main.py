@@ -91,14 +91,15 @@ class Room:
         return self.capacity > 0 and len(self.peer_ids) >= self.capacity
 
 
-class Registry:
+class GameState:
+    """Holds all state for a single game."""
+
     def __init__(self) -> None:
         self.rooms: dict[str, Room] = {}
         self.peers: dict[int, PeerSession] = {}
         self.lobby_subscriptions: dict[int, LobbySubscription] = {}
         self._next_peer_id: int = 1
         self._next_connection_id: int = 1
-        self.lock: asyncio.Lock = asyncio.Lock()
 
     def allocate_peer_id(self) -> int:
         peer_id: int = self._next_peer_id
@@ -109,6 +110,18 @@ class Registry:
         connection_id: int = self._next_connection_id
         self._next_connection_id += 1
         return connection_id
+
+
+class Registry:
+    def __init__(self) -> None:
+        self.games: dict[str, GameState] = {}
+        self.lock: asyncio.Lock = asyncio.Lock()
+
+    def get_or_create_game(self, game_id: str) -> GameState:
+        """Get or create a GameState for the given game_id."""
+        if game_id not in self.games:
+            self.games[game_id] = GameState()
+        return self.games[game_id]
 
 
 app = FastAPI(title="SimpleWebRTC Signaling Server", version="2.0.0")
@@ -136,18 +149,23 @@ async def send_error(websocket: WebSocket, message: str) -> None:
 
 
 async def broadcast_room(
-    room: Room, payload: dict[str, Any], exclude_peer_id: int | None = None
+    game_id: str,
+    room: Room,
+    payload: dict[str, Any],
+    exclude_peer_id: int | None = None,
 ) -> None:
     send_tasks: list[asyncio.Task[Any]] = []
-    for peer_id in room.peer_ids:
-        if exclude_peer_id is not None and peer_id == exclude_peer_id:
-            continue
-        peer_session: PeerSession | None = registry.peers.get(peer_id)
-        if peer_session is None:
-            continue
-        send_tasks.append(
-            asyncio.create_task(send_json(peer_session.websocket, payload))
-        )
+    async with registry.lock:
+        game_state = registry.get_or_create_game(game_id)
+        for peer_id in room.peer_ids:
+            if exclude_peer_id is not None and peer_id == exclude_peer_id:
+                continue
+            peer_session: PeerSession | None = game_state.peers.get(peer_id)
+            if peer_session is None:
+                continue
+            send_tasks.append(
+                asyncio.create_task(send_json(peer_session.websocket, payload))
+            )
 
     if send_tasks:
         results = await asyncio.gather(*send_tasks, return_exceptions=True)
@@ -199,14 +217,16 @@ async def health() -> dict[str, str]:
 async def heartbeat() -> dict[str, Any]:
     now: float = time.time()
     async with registry.lock:
-        rooms_count: int = len(registry.rooms)
-        peers_count: int = len(registry.peers)
+        rooms_count: int = sum(len(gs.rooms) for gs in registry.games.values())
+        peers_count: int = sum(len(gs.peers) for gs in registry.games.values())
+        games_count: int = len(registry.games)
 
     return {
         "status": "ok",
         "service": "simple-webrtc-signaling",
         "uptime_seconds": round(now - START_TIME, 3),
         "timestamp_unix": now,
+        "games": games_count,
         "rooms": rooms_count,
         "peers": peers_count,
     }
@@ -231,12 +251,18 @@ async def root_status() -> str:
         """
 
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket) -> None:
+@app.websocket("/ws/{game_id}")
+async def websocket_endpoint(websocket: WebSocket, game_id: str) -> None:
     await websocket.accept()
-    logger.info("WebSocket accepted from %s", _client_label(websocket))
-    connection_id: int = registry.allocate_connection_id()
+    logger.info(
+        "WebSocket accepted from %s (game_id=%s)", _client_label(websocket), game_id
+    )
+    connection_id: int
     peer_id: int | None = None
+
+    async with registry.lock:
+        game_state = registry.get_or_create_game(game_id)
+        connection_id = game_state.allocate_connection_id()
 
     try:
         while True:
@@ -246,21 +272,25 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             message_type: str = str(message.get("type", ""))
 
             if message_type == "join":
-                assigned_peer_id: int | None = await handle_join(websocket, message)
+                assigned_peer_id: int | None = await handle_join(
+                    game_id, websocket, message
+                )
                 if assigned_peer_id is not None:
                     peer_id = assigned_peer_id
                 continue
 
             if message_type == "list_lobbies":
-                await handle_list_lobbies(websocket, message)
+                await handle_list_lobbies(game_id, websocket, message)
                 continue
 
             if message_type == "subscribe_lobbies":
-                await handle_subscribe_lobbies(connection_id, websocket, message)
+                await handle_subscribe_lobbies(
+                    game_id, connection_id, websocket, message
+                )
                 continue
 
             if message_type == "unsubscribe_lobbies":
-                await handle_unsubscribe_lobbies(connection_id)
+                await handle_unsubscribe_lobbies(game_id, connection_id)
                 continue
 
             if peer_id is None:
@@ -268,30 +298,32 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 continue
 
             if message_type == "signal":
-                await handle_signal(peer_id, message)
+                await handle_signal(game_id, peer_id, message)
             elif message_type == "peer_connected":
-                await handle_peer_connected(peer_id)
+                await handle_peer_connected(game_id, peer_id)
             else:
                 await send_error(websocket, f"unknown_message_type:{message_type}")
 
     except WebSocketDisconnect:
         logger.info(
-            "WebSocket disconnected from %s (peer_id=%s)",
+            "WebSocket disconnected from %s (game_id=%s, peer_id=%s)",
             _client_label(websocket),
+            game_id,
             peer_id,
         )
         if peer_id is not None:
-            await handle_disconnect(peer_id)
-        await handle_unsubscribe_lobbies(connection_id)
+            await handle_disconnect(game_id, peer_id)
+        await handle_unsubscribe_lobbies(game_id, connection_id)
     except Exception:
         logger.exception(
-            "Unhandled exception in websocket loop for %s (peer_id=%s)",
+            "Unhandled exception in websocket loop for %s (game_id=%s, peer_id=%s)",
             _client_label(websocket),
+            game_id,
             peer_id,
         )
         if peer_id is not None:
-            await handle_disconnect(peer_id)
-        await handle_unsubscribe_lobbies(connection_id)
+            await handle_disconnect(game_id, peer_id)
+        await handle_unsubscribe_lobbies(game_id, connection_id)
 
 
 async def receive_client_message(websocket: WebSocket) -> dict[str, Any] | None:
@@ -332,7 +364,9 @@ async def receive_client_message(websocket: WebSocket) -> dict[str, Any] | None:
     return parsed
 
 
-async def handle_join(websocket: WebSocket, message: dict[str, Any]) -> int | None:
+async def handle_join(
+    game_id: str, websocket: WebSocket, message: dict[str, Any]
+) -> int | None:
     room_id: str = str(message.get("room_id", "")).strip()
     is_host_intent: bool = bool(message.get("is_host_intent", False))
     topology: Topology = (
@@ -352,8 +386,9 @@ async def handle_join(websocket: WebSocket, message: dict[str, Any]) -> int | No
         return None
 
     async with registry.lock:
-        peer_id: int = registry.allocate_peer_id()
-        room: Room | None = registry.rooms.get(room_id)
+        game_state = registry.get_or_create_game(game_id)
+        peer_id: int = game_state.allocate_peer_id()
+        room: Room | None = game_state.rooms.get(room_id)
 
         if room is None:
             if not is_host_intent:
@@ -366,7 +401,7 @@ async def handle_join(websocket: WebSocket, message: dict[str, Any]) -> int | No
                 capacity=capacity,
                 tags=tags,
             )
-            registry.rooms[room_id] = room
+            game_state.rooms[room_id] = room
             logger.info(
                 "Room created: room_id=%s host_id=%d topology=%s capacity=%d",
                 room_id,
@@ -397,7 +432,7 @@ async def handle_join(websocket: WebSocket, message: dict[str, Any]) -> int | No
         if room.is_full:
             room.is_sealed = True
 
-        registry.peers[peer_id] = PeerSession(
+        game_state.peers[peer_id] = PeerSession(
             peer_id=peer_id, websocket=websocket, room_id=room_id
         )
         existing_peers: list[int] = [pid for pid in room.peer_ids if pid != peer_id]
@@ -411,7 +446,7 @@ async def handle_join(websocket: WebSocket, message: dict[str, Any]) -> int | No
             room.capacity,
         )
 
-    await notify_lobby_room_changed(room_id)
+    await notify_lobby_room_changed(game_id, room_id)
 
     await send_json(
         websocket,
@@ -433,7 +468,7 @@ async def handle_join(websocket: WebSocket, message: dict[str, Any]) -> int | No
             notify_peer_ids = [room.host_id]
 
     for existing_peer_id in notify_peer_ids:
-        existing_session: PeerSession | None = registry.peers.get(existing_peer_id)
+        existing_session: PeerSession | None = game_state.peers.get(existing_peer_id)
         if existing_session is None:
             continue
         await send_json(
@@ -441,17 +476,20 @@ async def handle_join(websocket: WebSocket, message: dict[str, Any]) -> int | No
         )
 
     if room.is_full:
-        await maybe_emit_match_ready(room_id)
+        await maybe_emit_match_ready(game_id, room_id)
 
     return peer_id
 
 
-async def handle_list_lobbies(websocket: WebSocket, message: dict[str, Any]) -> None:
+async def handle_list_lobbies(
+    game_id: str, websocket: WebSocket, message: dict[str, Any]
+) -> None:
     tags: set[str] = _normalize_filter_tags(message.get("filter_tags", []))
 
     async with registry.lock:
+        game_state = registry.get_or_create_game(game_id)
         lobbies: list[dict[str, Any]] = _build_lobby_snapshot(
-            list(registry.rooms.values()), tags
+            list(game_state.rooms.values()), tags
         )
 
     # Keep legacy lobby_list for compatibility and include new snapshot event.
@@ -460,33 +498,36 @@ async def handle_list_lobbies(websocket: WebSocket, message: dict[str, Any]) -> 
 
 
 async def handle_subscribe_lobbies(
-    connection_id: int, websocket: WebSocket, message: dict[str, Any]
+    game_id: str, connection_id: int, websocket: WebSocket, message: dict[str, Any]
 ) -> None:
     filter_tags: set[str] = _normalize_filter_tags(message.get("filter_tags", []))
 
     async with registry.lock:
-        registry.lobby_subscriptions[connection_id] = LobbySubscription(
+        game_state = registry.get_or_create_game(game_id)
+        game_state.lobby_subscriptions[connection_id] = LobbySubscription(
             connection_id=connection_id,
             websocket=websocket,
             filter_tags=filter_tags,
         )
         lobbies: list[dict[str, Any]] = _build_lobby_snapshot(
-            list(registry.rooms.values()), filter_tags
+            list(game_state.rooms.values()), filter_tags
         )
 
     await send_json(websocket, {"type": "lobby_snapshot", "lobbies": lobbies})
 
 
-async def handle_unsubscribe_lobbies(connection_id: int) -> None:
+async def handle_unsubscribe_lobbies(game_id: str, connection_id: int) -> None:
     async with registry.lock:
-        registry.lobby_subscriptions.pop(connection_id, None)
+        game_state = registry.get_or_create_game(game_id)
+        game_state.lobby_subscriptions.pop(connection_id, None)
 
 
-async def notify_lobby_room_changed(room_id: str) -> None:
+async def notify_lobby_room_changed(game_id: str, room_id: str) -> None:
     async with registry.lock:
-        room: Room | None = registry.rooms.get(room_id)
+        game_state = registry.get_or_create_game(game_id)
+        room: Room | None = game_state.rooms.get(room_id)
         subscriptions: list[LobbySubscription] = list(
-            registry.lobby_subscriptions.values()
+            game_state.lobby_subscriptions.values()
         )
 
     send_tasks: list[asyncio.Task[Any]] = []
@@ -517,17 +558,22 @@ async def notify_lobby_room_changed(room_id: str) -> None:
                 logger.debug("Lobby delta send raised exception: %s", result)
 
 
-async def handle_signal(from_peer_id: int, message: dict[str, Any]) -> None:
+async def handle_signal(
+    game_id: str, from_peer_id: int, message: dict[str, Any]
+) -> None:
     target_id: int = int(message.get("target_id", 0))
     if target_id == 0:
-        source_session: PeerSession | None = registry.peers.get(from_peer_id)
+        async with registry.lock:
+            game_state = registry.get_or_create_game(game_id)
+            source_session: PeerSession | None = game_state.peers.get(from_peer_id)
         if source_session is not None:
             await send_error(source_session.websocket, "target_id_required")
         return
 
     async with registry.lock:
-        source_session = registry.peers.get(from_peer_id)
-        target_session = registry.peers.get(target_id)
+        game_state = registry.get_or_create_game(game_id)
+        source_session = game_state.peers.get(from_peer_id)
+        target_session = game_state.peers.get(target_id)
         if source_session is None or target_session is None:
             return
 
@@ -542,7 +588,7 @@ async def handle_signal(from_peer_id: int, message: dict[str, Any]) -> None:
             await send_error(source_session.websocket, "cross_room_signal_blocked")
             return
 
-        room: Room | None = registry.rooms.get(source_session.room_id)
+        room: Room | None = game_state.rooms.get(source_session.room_id)
         if room is None:
             return
         room.update_activity()
@@ -559,12 +605,13 @@ async def handle_signal(from_peer_id: int, message: dict[str, Any]) -> None:
     await send_json(target_session.websocket, relay_payload)
 
 
-async def handle_peer_connected(peer_id: int) -> None:
+async def handle_peer_connected(game_id: str, peer_id: int) -> None:
     async with registry.lock:
-        session: PeerSession | None = registry.peers.get(peer_id)
+        game_state = registry.get_or_create_game(game_id)
+        session: PeerSession | None = game_state.peers.get(peer_id)
         if session is None:
             return
-        room: Room | None = registry.rooms.get(session.room_id)
+        room: Room | None = game_state.rooms.get(session.room_id)
         if room is None:
             return
         room.connected_ack.add(peer_id)
@@ -577,12 +624,13 @@ async def handle_peer_connected(peer_id: int) -> None:
             len(room.peer_ids),
         )
 
-    await maybe_emit_match_ready(session.room_id)
+    await maybe_emit_match_ready(game_id, session.room_id)
 
 
-async def maybe_emit_match_ready(room_id: str) -> None:
+async def maybe_emit_match_ready(game_id: str, room_id: str) -> None:
     async with registry.lock:
-        room: Room | None = registry.rooms.get(room_id)
+        game_state = registry.get_or_create_game(game_id)
+        room: Room | None = game_state.rooms.get(room_id)
         if room is None:
             return
 
@@ -597,15 +645,16 @@ async def maybe_emit_match_ready(room_id: str) -> None:
 
     logger.info("Match ready: room_id=%s players=%d", room_id, len(room.peer_ids))
 
-    await broadcast_room(room, payload)
+    await broadcast_room(game_id, room, payload)
 
 
-async def handle_disconnect(peer_id: int) -> None:
+async def handle_disconnect(game_id: str, peer_id: int) -> None:
     async with registry.lock:
-        session: PeerSession | None = registry.peers.pop(peer_id, None)
+        game_state = registry.get_or_create_game(game_id)
+        session: PeerSession | None = game_state.peers.pop(peer_id, None)
         if session is None:
             return
-        room: Room | None = registry.rooms.get(session.room_id)
+        room: Room | None = game_state.rooms.get(session.room_id)
         if room is None:
             return
 
@@ -618,7 +667,7 @@ async def handle_disconnect(peer_id: int) -> None:
         peers_left: list[int] = list(room.peer_ids)
 
         if host_disconnected or is_empty:
-            registry.rooms.pop(room.room_id, None)
+            game_state.rooms.pop(room.room_id, None)
         else:
             room.is_sealed = False
 
@@ -631,11 +680,11 @@ async def handle_disconnect(peer_id: int) -> None:
         )
 
     if host_disconnected:
-        await broadcast_room(room, {"type": "room_closed"})
+        await broadcast_room(game_id, room, {"type": "room_closed"})
     elif peers_left:
-        await broadcast_room(room, {"type": "peer_left", "peer_id": peer_id})
+        await broadcast_room(game_id, room, {"type": "peer_left", "peer_id": peer_id})
 
-    await notify_lobby_room_changed(room.room_id)
+    await notify_lobby_room_changed(game_id, room.room_id)
 
 
 @app.on_event("startup")
@@ -660,23 +709,32 @@ async def prune_stale_rooms() -> None:
         await asyncio.sleep(60.0)
         now: float = time.time()
 
-        async with registry.lock:
-            stale_room_ids: list[str] = [
-                room_id
-                for room_id, room in registry.rooms.items()
-                if now - room.last_activity > stale_after_seconds
-            ]
+        # Collect stale rooms across all games
+        stale_rooms: list[tuple[str, str, Room]] = []  # (game_id, room_id, room)
 
-            for room_id in stale_room_ids:
-                room: Room = registry.rooms.pop(room_id)
-                for peer_id in list(room.peer_ids):
-                    registry.peers.pop(peer_id, None)
+        async with registry.lock:
+            for game_id, game_state in registry.games.items():
+                for room_id, room in list(game_state.rooms.items()):
+                    if now - room.last_activity > stale_after_seconds:
+                        stale_rooms.append((game_id, room_id, room))
+
+        # Prune stale rooms and cleanup peers
+        for game_id, room_id, room in stale_rooms:
+            async with registry.lock:
+                game_state = registry.games.get(game_id)
+                if game_state is None:
+                    continue
+                removed_room = game_state.rooms.pop(room_id, None)
+                if removed_room is None:
+                    continue
+                for peer_id in list(removed_room.peer_ids):
+                    game_state.peers.pop(peer_id, None)
                 logger.info(
-                    "Pruned stale room: room_id=%s inactive_for=%.1fs removed_peers=%d",
+                    "Pruned stale room: game_id=%s room_id=%s inactive_for=%.1fs removed_peers=%d",
+                    game_id,
                     room_id,
-                    now - room.last_activity,
-                    len(room.peer_ids),
+                    now - removed_room.last_activity,
+                    len(removed_room.peer_ids),
                 )
 
-        for room_id in stale_room_ids:
-            await notify_lobby_room_changed(room_id)
+            await notify_lobby_room_changed(game_id, room_id)

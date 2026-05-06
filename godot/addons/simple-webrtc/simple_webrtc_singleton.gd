@@ -71,14 +71,32 @@ signal connection_error(reason: String)
 ## Emitted whenever the internal lifecycle state changes.
 signal state_changed(new_state: int)
 
+## Human-readable messages for signaling error codes.
+const SIGNALING_ERROR_MESSAGES: Dictionary = {
+	"signaling_url_required": "Signaling URL is missing. Set game_id and signaling_server_url before joining.",
+	"room_id_required": "Room ID is required to join or host a lobby.",
+	"room_not_found": "Lobby not found. Check the room id or host the lobby first.",
+	"topology_mismatch": "Topology mismatch. The lobby uses a different topology.",
+	"room_unavailable": "Lobby is full or unavailable.",
+	"host_already_exists": "A host already exists for this lobby.",
+	"join_required": "Join the lobby before sending signaling messages.",
+	"invalid_json": "Received invalid JSON from signaling server.",
+	"json_object_required": "Received non-object JSON from signaling server.",
+	"invalid_utf8_payload": "Received invalid UTF-8 payload from signaling server.",
+	"empty_payload": "Received empty payload from signaling server.",
+}
+
 ## Default WebSocket endpoint for the signaling server.
 const DEFAULT_SIGNALING_URL: String = "ws://127.0.0.1:8000/ws"
 ## Maximum time to wait for a per-peer WebRTC handshake before failing.
 const HANDSHAKE_TIMEOUT_SECONDS: float = 15.0
 
-## Signaling server URL used by [method join_lobby] and [method host_lobby].
+## Signaling server base URL (without game_id). Game ID will be appended to this URL.
 ## Set this before connecting if your signaling server is not local.
-var signaling_url: String = DEFAULT_SIGNALING_URL
+var signaling_server_url: String = "ws://127.0.0.1:8000/ws"
+## Game ID for this client. This scopes all lobbies and matchmaking to this game.
+## Must be set before calling join_lobby() or host_lobby().
+var game_id: String = ""
 ## ICE server configuration passed to [method WebRTCPeerConnection.initialize].
 ## Defaults to Google's public STUN server. Can be replaced before joining/hosting.
 var ice_servers: Array[Dictionary] = [
@@ -131,12 +149,19 @@ func _process(_delta: float) -> void:
 	_lobby_feed.poll()
 
 
+func _get_signaling_url() -> String:
+	if game_id == "":
+		push_error("game_id must be set before connecting")
+		return ""
+	return signaling_server_url.trim_suffix("/") + "/" + game_id
+
+
 ## Connects the dedicated websocket lobby feed.
 ##
-## Returns [code]OK[/code] on success or [code]FAILED[/code] if [member signaling_url]
-## is invalid or the websocket cannot start connecting.
+## Returns [code]OK[/code] on success or [code]FAILED[/code] if [member game_id]
+## is empty, [member signaling_server_url] is invalid, or the websocket cannot start connecting.
 func connect_lobby_feed() -> Error:
-	_lobby_feed.signaling_url = signaling_url
+	_lobby_feed.signaling_url = _get_signaling_url()
 	return _lobby_feed.connect_lobby_feed()
 
 
@@ -149,7 +174,7 @@ func disconnect_lobby_feed() -> void:
 ##
 ## [param filter_tags] applies server-side tag filtering.
 func subscribe_lobbies(filter_tags: PackedStringArray = PackedStringArray()) -> void:
-	_lobby_feed.signaling_url = signaling_url
+	_lobby_feed.signaling_url = _get_signaling_url()
 	_lobby_feed.subscribe_lobbies(filter_tags)
 
 
@@ -162,7 +187,7 @@ func unsubscribe_lobbies() -> void:
 ##
 ## This keeps compatibility with existing [signal lobby_list_received] consumers.
 func refresh_lobby_list(filter_tags: PackedStringArray = PackedStringArray()) -> void:
-	_lobby_feed.signaling_url = signaling_url
+	_lobby_feed.signaling_url = _get_signaling_url()
 	_lobby_feed.refresh_lobby_list(filter_tags)
 
 
@@ -219,7 +244,7 @@ func _connect_to_signaling(room_id: String, is_host_intent: bool, topology: Topo
 	_is_host = is_host_intent
 	_capacity = capacity
 	_transition_to(State.SIGNALING)
-	_signaling.signaling_url = signaling_url
+	_signaling.signaling_url = _get_signaling_url()
 	var connect_error: Error = _signaling.connect_to_signaling(room_id, is_host_intent, _topology_to_string(topology), capacity)
 	if connect_error != OK:
 		_cleanup()
@@ -296,7 +321,8 @@ func _cleanup() -> void:
 
 
 func _on_signaling_error(reason: String) -> void:
-	connection_error.emit(reason)
+	var friendly_reason: String = _format_signaling_error(reason)
+	connection_error.emit(friendly_reason)
 	leave()
 
 
@@ -354,3 +380,16 @@ func _on_lobby_delta_received(op: String, room_id: String, lobby: Dictionary) ->
 
 func _on_lobby_error(reason: String) -> void:
 	lobby_error.emit(reason)
+	push_error(reason)
+
+
+func _format_signaling_error(reason: String) -> String:
+	var trimmed_reason: String = reason.strip_edges()
+	if trimmed_reason.is_empty():
+		return "Unknown signaling error"
+	var code: String = trimmed_reason
+	if ":" in trimmed_reason:
+		code = trimmed_reason.split(":", false, 1)[0]
+	if SIGNALING_ERROR_MESSAGES.has(code):
+		return SIGNALING_ERROR_MESSAGES[code]
+	return trimmed_reason
